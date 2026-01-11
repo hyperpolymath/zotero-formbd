@@ -84,6 +84,8 @@ while [[ $# -gt 0 ]]; do
                 rm -f ~/.local/bin/formdb-migrate
                 rm -f ~/.local/bin/formdb-score
                 rm -f ~/.local/bin/formdb-doi
+                rm -f ~/.local/bin/formdb-publisher
+                rm -f ~/.local/bin/formdb-blindspot
                 echo -e "${GREEN}✓ FormDB uninstalled${NC}"
             else
                 echo "Cancelled."
@@ -235,11 +237,13 @@ show_plan() {
     echo
 
     echo -e "${BOLD}Commands that will be installed:${NC}"
-    echo "  🔧 formdb-server   - Start the Zotero-compatible API server"
-    echo "  🔧 formdb-sync     - Sync changes from Zotero"
-    echo "  🔧 formdb-migrate  - Re-run full migration"
-    echo "  🔧 formdb-score    - PROMPT evidence quality scoring (v0.2.0)"
-    echo "  🔧 formdb-doi      - DOI immutability management (v0.3.0)"
+    echo "  🔧 formdb-server    - Start the Zotero-compatible API server"
+    echo "  🔧 formdb-sync      - Sync changes from Zotero"
+    echo "  🔧 formdb-migrate   - Re-run full migration"
+    echo "  🔧 formdb-score     - PROMPT evidence quality scoring (v0.2.0)"
+    echo "  🔧 formdb-doi       - DOI immutability management (v0.3.0)"
+    echo "  🔧 formdb-publisher - Publisher registry management (v0.4.0)"
+    echo "  🔧 formdb-blindspot - Library blindspot analysis (v0.4.0)"
     echo
 
     echo -e "${BOLD}What will NOT be modified:${NC}"
@@ -351,6 +355,8 @@ install_commands() {
         echo "  Would create: $bin_dir/formdb-migrate"
         echo "  Would create: $bin_dir/formdb-score"
         echo "  Would create: $bin_dir/formdb-doi"
+        echo "  Would create: $bin_dir/formdb-publisher"
+        echo "  Would create: $bin_dir/formdb-blindspot"
         return 0
     fi
 
@@ -430,6 +436,26 @@ exec julia --project=. bin/doi.jl "$@"
 SCRIPT
     chmod +x "$bin_dir/formdb-doi"
 
+    # formdb-publisher (v0.4.0)
+    cat > "$bin_dir/formdb-publisher" << 'SCRIPT'
+#!/usr/bin/env bash
+# Publisher registry management
+FORMDB_HOME="${FORMDB_HOME:-$HOME/.formdb}"
+cd "$FORMDB_HOME/repo/migration"
+exec julia --project=. bin/publisher.jl "$@"
+SCRIPT
+    chmod +x "$bin_dir/formdb-publisher"
+
+    # formdb-blindspot (v0.4.0)
+    cat > "$bin_dir/formdb-blindspot" << 'SCRIPT'
+#!/usr/bin/env bash
+# Library blindspot analysis
+FORMDB_HOME="${FORMDB_HOME:-$HOME/.formdb}"
+cd "$FORMDB_HOME/repo/migration"
+exec julia --project=. bin/blindspot.jl "$@"
+SCRIPT
+    chmod +x "$bin_dir/formdb-blindspot"
+
     log_success "Commands installed to $bin_dir/"
 
     # Check if bin is in PATH
@@ -461,6 +487,8 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     rm -f "$HOME/.local/bin/formdb-migrate"
     rm -f "$HOME/.local/bin/formdb-score"
     rm -f "$HOME/.local/bin/formdb-doi"
+    rm -f "$HOME/.local/bin/formdb-publisher"
+    rm -f "$HOME/.local/bin/formdb-blindspot"
     echo "FormDB uninstalled."
 fi
 SCRIPT
@@ -486,6 +514,8 @@ show_complete() {
     echo "  formdb-migrate --apply  # Re-run full migration"
     echo "  formdb-score          # PROMPT evidence scoring (v0.2.0)"
     echo "  formdb-doi            # DOI management (v0.3.0)"
+    echo "  formdb-publisher      # Publisher registry (v0.4.0)"
+    echo "  formdb-blindspot      # Blindspot analysis (v0.4.0)"
     echo
 
     echo -e "${BOLD}Quick start:${NC}"

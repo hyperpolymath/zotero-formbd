@@ -158,11 +158,13 @@ function Show-Plan {
     Write-Host ""
 
     Write-Host "Commands that will be installed:" -ForegroundColor White
-    Write-Host "  formdb-server   - Start the Zotero-compatible API server"
-    Write-Host "  formdb-sync     - Sync changes from Zotero"
-    Write-Host "  formdb-migrate  - Re-run full migration"
-    Write-Host "  formdb-score    - PROMPT evidence quality scoring (v0.2.0)"
-    Write-Host "  formdb-doi      - DOI immutability management (v0.3.0)"
+    Write-Host "  formdb-server    - Start the Zotero-compatible API server"
+    Write-Host "  formdb-sync      - Sync changes from Zotero"
+    Write-Host "  formdb-migrate   - Re-run full migration"
+    Write-Host "  formdb-score     - PROMPT evidence quality scoring (v0.2.0)"
+    Write-Host "  formdb-doi       - DOI immutability management (v0.3.0)"
+    Write-Host "  formdb-publisher - Publisher registry management (v0.4.0)"
+    Write-Host "  formdb-blindspot - Library blindspot analysis (v0.4.0)"
     Write-Host ""
 
     Write-Host "What will NOT be modified:" -ForegroundColor White
@@ -260,6 +262,8 @@ function Install-Commands {
         Write-Host "  Would create: $BinDir\formdb-migrate.bat"
         Write-Host "  Would create: $BinDir\formdb-score.bat"
         Write-Host "  Would create: $BinDir\formdb-doi.bat"
+        Write-Host "  Would create: $BinDir\formdb-publisher.bat"
+        Write-Host "  Would create: $BinDir\formdb-blindspot.bat"
         return
     }
 
@@ -320,6 +324,24 @@ cd /d "%FORMDB_HOME%\repo\migration"
 julia --project=. bin/doi.jl %*
 "@ | Set-Content "$BinDir\formdb-doi.bat" -Encoding ASCII
 
+    # formdb-publisher.bat (v0.4.0)
+    @"
+@echo off
+REM Publisher registry management
+set FORMDB_HOME=%USERPROFILE%\.formdb
+cd /d "%FORMDB_HOME%\repo\migration"
+julia --project=. bin/publisher.jl %*
+"@ | Set-Content "$BinDir\formdb-publisher.bat" -Encoding ASCII
+
+    # formdb-blindspot.bat (v0.4.0)
+    @"
+@echo off
+REM Library blindspot analysis
+set FORMDB_HOME=%USERPROFILE%\.formdb
+cd /d "%FORMDB_HOME%\repo\migration"
+julia --project=. bin/blindspot.jl %*
+"@ | Set-Content "$BinDir\formdb-blindspot.bat" -Encoding ASCII
+
     Write-Success "Commands installed to $BinDir\"
 
     # Add to PATH if not already there
@@ -370,6 +392,8 @@ function Show-Complete {
     Write-Host "  formdb-migrate -Apply # Re-run full migration"
     Write-Host "  formdb-score          # PROMPT evidence scoring (v0.2.0)"
     Write-Host "  formdb-doi            # DOI management (v0.3.0)"
+    Write-Host "  formdb-publisher      # Publisher registry (v0.4.0)"
+    Write-Host "  formdb-blindspot      # Blindspot analysis (v0.4.0)"
     Write-Host ""
 
     Write-Host "Quick start:" -ForegroundColor White

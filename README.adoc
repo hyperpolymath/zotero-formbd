@@ -212,11 +212,23 @@ Invoke-RestMethod http://localhost:8080/users/local/items
 | Evidence quality scores
 | ❌
 | ✓ PROMPT framework
+
+| Publisher quality tracking
+| ❌
+| ✓ Ownership & bias ratings
+
+| Funding transparency
+| ❌
+| ✓ "Who paid for this?"
+
+| Library blindspot detection
+| ❌
+| ✓ Like Ground News for papers
 |===
 
 == Commands Reference
 
-After installation, you have four commands:
+After installation, you have seven commands:
 
 [source,bash]
 ----
@@ -306,6 +318,47 @@ curl "http://localhost:8080/users/local/items?hasDOI=true"
 
 # List only play-variants
 curl "http://localhost:8080/users/local/items?isVariant=true"
+
+# Publisher Registry (v0.4.0)
+# List all registered publishers
+curl "http://localhost:8080/users/local/publishers"
+
+# Get a specific publisher
+curl "http://localhost:8080/users/local/publishers/nature"
+
+# Add a publisher
+curl -X PUT "http://localhost:8080/users/local/publishers/nature" \
+    -H "Content-Type: application/json" \
+    -d '{"name": "Nature Publishing Group", "ownership": "commercial_large", "website": "https://www.nature.com"}'
+
+# Score a publisher
+curl -X PUT "http://localhost:8080/users/local/publishers/nature/scores" \
+    -H "Content-Type: application/json" \
+    -d '{"peer_review_rigor": 95, "transparency": 80, "accessibility": 60}'
+
+# Funding Tracking (v0.4.0)
+# Get funding info for an item
+curl "http://localhost:8080/users/local/items/ABC12345/funding"
+
+# Set funding info for an item
+curl -X PUT "http://localhost:8080/users/local/items/ABC12345/funding" \
+    -H "Content-Type: application/json" \
+    -d '{"sources": [{"category": "government", "funder": "NSF", "grant_id": "123456"}]}'
+
+# Multi-Scorer PROMPT (v0.4.0)
+# Add another evaluator's scores (aggregates multiple opinions)
+curl -X POST "http://localhost:8080/users/local/items/ABC12345/prompt-scores-multi" \
+    -H "Content-Type: application/json" \
+    -d '{"scorer_id": "reviewer2", "provenance": 85, "methodology": 90}'
+
+# Get aggregated scores with consensus metrics
+curl "http://localhost:8080/users/local/items/ABC12345/prompt-scores-multi"
+# Returns: average, range, std_dev, consensus_level (high/medium/low)
+
+# Blindspot Analysis (v0.4.0)
+# Get full blindspot analysis
+curl "http://localhost:8080/users/local/blindspots"
+# Detects: funding_concentration, publisher_concentration, methodology_quality issues
 ----
 
 == Uninstall
@@ -530,7 +583,17 @@ julia --project=. bin/migrate.jl --from /path/to/your/zotero.sqlite --to ~/.form
 * API endpoints: `/doi-status`, `/create-variant`
 * Query filters: `?hasDOI=true`, `?isVariant=true`
 
-=== v0.4.0: Full Integration (Next)
+=== v0.4.0: Source Intelligence ✓
+* Publisher/Journal registry with ownership tracking (like Ground News)
+* Publisher quality scoring (peer review, transparency, accessibility)
+* Funding source tracking (who paid for this research?)
+* Multi-scorer PROMPT aggregation (multiple evaluators, consensus metrics)
+* Blindspot detection (funding concentration, publisher concentration)
+* `formdb-publisher` CLI for publisher management
+* `formdb-blindspot` CLI for library bias analysis
+* API endpoints: `/publishers`, `/funding`, `/blindspots`, `/prompt-scores-multi`
+
+=== v0.5.0: Full Integration (Next)
 * Browser connector plugin
 * Desktop app integration
 * Real-time sync

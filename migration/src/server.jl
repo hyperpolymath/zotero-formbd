@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """
-Zotero-Compatible REST API Server (v0.3.0)
+Zotero-Compatible REST API Server (v0.4.0)
 
 Serves FormDB journal data through Zotero's REST API endpoints.
 This allows existing Zotero clients to work with FormDB storage.
@@ -23,6 +23,14 @@ DOI immutability endpoints (v0.3.0):
   GET  /users/:userID/items/:key/doi-status    - Check if canonical/variant
   POST /users/:userID/items/:key/create-variant - Create editable play-variant
 
+Publisher registry endpoints (v0.4.0):
+  GET  /users/:userID/publishers                - List all publishers
+  GET  /users/:userID/publishers/:key           - Get publisher details
+  PUT  /users/:userID/publishers/:key           - Update publisher scores
+  GET  /users/:userID/items/:key/funding        - Get item funding sources
+  PUT  /users/:userID/items/:key/funding        - Set item funding sources
+  GET  /users/:userID/blindspots                - Get blindspot analysis
+
 Query parameters supported:
   format=json (default)
   limit=100 (default, max 100)
@@ -35,6 +43,8 @@ Query parameters supported:
   hasScore=true (filter to only items with PROMPT scores)
   hasDOI=true (filter to only DOI items - v0.3.0)
   isVariant=true (filter to only play-variants - v0.3.0)
+  fundingType=industry,academic,... (filter by funding - v0.4.0)
+  publisherScore=0-100 (filter by publisher quality - v0.4.0)
 """
 module ZoteroServer
 
@@ -58,6 +68,41 @@ end
 # PROMPT framework dimensions
 const PROMPT_DIMENSIONS = ["provenance", "replicability", "objectivity", "methodology", "publication", "transparency"]
 
+# Funding source categories (v0.4.0) - inspired by Ground News ownership tracking
+const FUNDING_CATEGORIES = [
+    "academic",      # University/academic institution funded
+    "government",    # Government grants (NIH, NSF, etc.)
+    "industry",      # Commercial/corporate funded
+    "foundation",    # Non-profit foundation (Gates, Wellcome, etc.)
+    "ngo",           # NGO/advocacy organization
+    "crowdfunded",   # Public/crowdfunded research
+    "self-funded",   # Author self-funded
+    "mixed",         # Multiple funding sources
+    "unknown"        # Funding not disclosed
+]
+
+# Publisher ownership categories (v0.4.0) - adapted from Ground News
+const OWNERSHIP_CATEGORIES = [
+    "academic_society",    # Learned society (ACS, IEEE, etc.)
+    "university_press",    # University-owned press
+    "commercial_large",    # Large commercial (Elsevier, Springer, Wiley)
+    "commercial_small",    # Smaller commercial publishers
+    "open_access",         # Pure OA publishers (PLOS, MDPI, Frontiers)
+    "government",          # Government publishers
+    "independent",         # Independent/nonprofit
+    "predatory",           # Known predatory publishers
+    "unknown"              # Classification unknown
+]
+
+# Publisher quality dimensions (v0.4.0)
+const PUBLISHER_DIMENSIONS = [
+    "peer_review_rigor",   # Quality of peer review process
+    "retraction_rate",     # Inverse - lower is better (normalized)
+    "transparency",        # Editorial transparency
+    "reproducibility",     # Support for reproducibility
+    "accessibility"        # Open access policies
+]
+
 """
 Calculate overall PROMPT score (average of 6 dimensions).
 Each dimension should be 0-100.
@@ -74,6 +119,191 @@ function calculate_overall_score(scores::Dict{String, Any})::Float64
     return count > 0 ? total / count : 0.0
 end
 
+"""
+Calculate publisher quality score (average of publisher dimensions).
+"""
+function calculate_publisher_score(scores::Dict{String, Any})::Float64
+    total = 0.0
+    count = 0
+    for dim in PUBLISHER_DIMENSIONS
+        if haskey(scores, dim)
+            total += scores[dim]
+            count += 1
+        end
+    end
+    return count > 0 ? total / count : 0.0
+end
+
+"""
+Aggregate multiple PROMPT scores from different scorers (v0.4.0).
+Returns average, range, standard deviation, and individual scores.
+"""
+function aggregate_prompt_scores(scores_list::Vector{Dict{String, Any}})::Dict{String, Any}
+    if isempty(scores_list)
+        return Dict{String, Any}()
+    end
+
+    result = Dict{String, Any}(
+        "scorer_count" => length(scores_list),
+        "scorers" => scores_list
+    )
+
+    # Aggregate each dimension
+    for dim in PROMPT_DIMENSIONS
+        values = Float64[]
+        for scores in scores_list
+            if haskey(scores, dim)
+                push!(values, Float64(scores[dim]))
+            end
+        end
+
+        if !isempty(values)
+            avg = sum(values) / length(values)
+            min_val = minimum(values)
+            max_val = maximum(values)
+            range_val = max_val - min_val
+
+            # Standard deviation
+            variance = sum((v - avg)^2 for v in values) / length(values)
+            std_dev = sqrt(variance)
+
+            result[dim] = Dict(
+                "average" => round(avg, digits=1),
+                "min" => min_val,
+                "max" => max_val,
+                "range" => range_val,
+                "std_dev" => round(std_dev, digits=2),
+                "consensus" => range_val <= 20 ? "high" : range_val <= 40 ? "medium" : "low"
+            )
+        end
+    end
+
+    # Calculate overall aggregated score
+    overall_values = Float64[]
+    for scores in scores_list
+        overall = calculate_overall_score(scores)
+        if overall > 0
+            push!(overall_values, overall)
+        end
+    end
+
+    if !isempty(overall_values)
+        avg = sum(overall_values) / length(overall_values)
+        result["overall"] = Dict(
+            "average" => round(avg, digits=1),
+            "min" => minimum(overall_values),
+            "max" => maximum(overall_values),
+            "range" => maximum(overall_values) - minimum(overall_values)
+        )
+    end
+
+    return result
+end
+
+"""
+Detect blindspots in the library (v0.4.0).
+Identifies topics/areas with:
+- Predominantly single funding source
+- Low methodological diversity
+- Skewed publisher representation
+"""
+function detect_blindspots(index::JournalIndex)::Vector{Dict{String, Any}}
+    blindspots = Vector{Dict{String, Any}}()
+
+    # Analyze funding distribution
+    funding_counts = Dict{String, Int}()
+    total_with_funding = 0
+
+    for (key, funding) in index.item_funding
+        category = get(funding, "primary_category", "unknown")
+        funding_counts[category] = get(funding_counts, category, 0) + 1
+        total_with_funding += 1
+    end
+
+    if total_with_funding > 0
+        for (category, count) in funding_counts
+            proportion = count / total_with_funding
+            if proportion >= 0.7 && category != "unknown"
+                push!(blindspots, Dict{String, Any}(
+                    "type" => "funding_concentration",
+                    "category" => category,
+                    "proportion" => round(proportion * 100, digits=1),
+                    "count" => count,
+                    "total" => total_with_funding,
+                    "severity" => proportion >= 0.85 ? "high" : "medium",
+                    "message" => "$(round(proportion * 100, digits=0))% of items are funded by $category sources"
+                ))
+            end
+        end
+
+        # Check for funding blindspot (missing categories)
+        for category in FUNDING_CATEGORIES
+            if category != "unknown" && !haskey(funding_counts, category)
+                push!(blindspots, Dict{String, Any}(
+                    "type" => "funding_gap",
+                    "category" => category,
+                    "severity" => "low",
+                    "message" => "No items from $category funding sources"
+                ))
+            end
+        end
+    end
+
+    # Analyze publisher distribution
+    publisher_counts = Dict{String, Int}()
+    total_with_publisher = 0
+
+    for (key, pub_key) in index.item_publishers
+        publisher_counts[pub_key] = get(publisher_counts, pub_key, 0) + 1
+        total_with_publisher += 1
+    end
+
+    if total_with_publisher >= 10
+        for (pub_key, count) in publisher_counts
+            proportion = count / total_with_publisher
+            if proportion >= 0.5
+                pub_data = get(index.publishers, pub_key, Dict{String, Any}())
+                pub_name = get(pub_data, "name", pub_key)
+                push!(blindspots, Dict{String, Any}(
+                    "type" => "publisher_concentration",
+                    "publisher" => pub_name,
+                    "publisher_key" => pub_key,
+                    "proportion" => round(proportion * 100, digits=1),
+                    "count" => count,
+                    "severity" => proportion >= 0.7 ? "high" : "medium",
+                    "message" => "$(round(proportion * 100, digits=0))% of items from single publisher: $pub_name"
+                ))
+            end
+        end
+    end
+
+    # Analyze PROMPT score distribution (methodology blindspots)
+    methodology_scores = Float64[]
+    for (key, scores) in index.prompt_scores
+        if haskey(scores, "methodology")
+            push!(methodology_scores, Float64(scores["methodology"]))
+        end
+    end
+
+    if length(methodology_scores) >= 5
+        avg_methodology = sum(methodology_scores) / length(methodology_scores)
+        low_methodology_count = count(s -> s < 50, methodology_scores)
+        low_proportion = low_methodology_count / length(methodology_scores)
+
+        if low_proportion >= 0.5
+            push!(blindspots, Dict{String, Any}(
+                "type" => "methodology_quality",
+                "average_score" => round(avg_methodology, digits=1),
+                "low_score_proportion" => round(low_proportion * 100, digits=1),
+                "severity" => low_proportion >= 0.7 ? "high" : "medium",
+                "message" => "$(round(low_proportion * 100, digits=0))% of items have methodology scores below 50"
+            ))
+        end
+    end
+
+    return blindspots
+end
+
 # In-memory index for fast lookups
 mutable struct JournalIndex
     items::Dict{String, Dict{String, Any}}
@@ -85,6 +315,14 @@ mutable struct JournalIndex
     # DOI immutability tracking (v0.3.0)
     canonical_dois::Dict{String, String}     # DOI string -> canonical item key
     variant_parents::Dict{String, String}    # variant item key -> parent DOI
+    # Publisher registry (v0.4.0)
+    publishers::Dict{String, Dict{String, Any}}           # publisher_key -> publisher data
+    publisher_scores::Dict{String, Dict{String, Any}}     # publisher_key -> quality scores
+    item_publishers::Dict{String, String}                 # item_key -> publisher_key
+    # Funding tracking (v0.4.0)
+    item_funding::Dict{String, Dict{String, Any}}         # item_key -> funding info
+    # Multi-scorer PROMPT (v0.4.0)
+    prompt_scores_multi::Dict{String, Vector{Dict{String, Any}}}  # item_key -> [scorer ratings]
     last_version::Int
     lock::ReentrantLock
 end
@@ -98,6 +336,11 @@ JournalIndex() = JournalIndex(
     Dict{String, Dict{String, Any}}(),
     Dict{String, String}(),  # canonical_dois
     Dict{String, String}(),  # variant_parents
+    Dict{String, Dict{String, Any}}(),  # publishers
+    Dict{String, Dict{String, Any}}(),  # publisher_scores
+    Dict{String, String}(),              # item_publishers
+    Dict{String, Dict{String, Any}}(),  # item_funding
+    Dict{String, Vector{Dict{String, Any}}}(),  # prompt_scores_multi
     0,
     ReentrantLock()
 )
@@ -254,6 +497,48 @@ function process_entry!(index::JournalIndex, entry::Dict{String, Any})
                 scores["scored_at"] = get(data, "scored_at", "")
                 scores["scored_by"] = get(data, "scored_by", "")
                 index.prompt_scores[item_key] = scores
+            end
+        # v0.4.0: Publisher registry
+        elseif entry_type == "publisher"
+            pub_key = get(data, "key", "")
+            if !isempty(pub_key)
+                index.publishers[pub_key] = data
+            end
+        elseif entry_type == "publisher_score"
+            pub_key = get(data, "publisherKey", "")
+            if !isempty(pub_key)
+                scores = get(data, "scores", Dict{String, Any}())
+                scores["overall"] = calculate_publisher_score(scores)
+                scores["scored_at"] = get(data, "scored_at", "")
+                scores["scored_by"] = get(data, "scored_by", "")
+                index.publisher_scores[pub_key] = scores
+            end
+        elseif entry_type == "item_publisher"
+            item_key = get(data, "itemKey", "")
+            pub_key = get(data, "publisherKey", "")
+            if !isempty(item_key) && !isempty(pub_key)
+                index.item_publishers[item_key] = pub_key
+            end
+        # v0.4.0: Funding tracking
+        elseif entry_type == "item_funding"
+            item_key = get(data, "itemKey", "")
+            if !isempty(item_key)
+                index.item_funding[item_key] = data
+            end
+        # v0.4.0: Multi-scorer PROMPT
+        elseif entry_type == "prompt_score_multi"
+            item_key = get(data, "itemKey", "")
+            if !isempty(item_key)
+                scorer_data = Dict{String, Any}(
+                    "scorer_id" => get(data, "scorer_id", "anonymous"),
+                    "scores" => get(data, "scores", Dict{String, Any}()),
+                    "scored_at" => get(data, "scored_at", ""),
+                    "rationale" => get(data, "rationale", "")
+                )
+                if !haskey(index.prompt_scores_multi, item_key)
+                    index.prompt_scores_multi[item_key] = Vector{Dict{String, Any}}()
+                end
+                push!(index.prompt_scores_multi[item_key], scorer_data)
             end
         end
     end
@@ -1113,6 +1398,541 @@ function handle_create_variant(req::HTTP.Request, params::Dict{String, String})
     end
 end
 
+# Publisher registry handlers (v0.4.0)
+
+"""
+Get all publishers in the registry.
+GET /users/:userID/publishers
+"""
+function handle_get_publishers(req::HTTP.Request, params::Dict{String, String})
+    index = JOURNAL_INDEX[]
+    version = index.last_version
+
+    publishers = Vector{Dict{String, Any}}()
+
+    lock(index.lock) do
+        for (key, pub) in index.publishers
+            pub_response = Dict{String, Any}(
+                "key" => key,
+                "name" => get(pub, "name", key),
+                "ownership" => get(pub, "ownership", "unknown"),
+                "website" => get(pub, "website", ""),
+                "issn" => get(pub, "issn", []),
+                "itemCount" => count(p -> p.second == key, index.item_publishers)
+            )
+
+            # Add scores if available
+            if haskey(index.publisher_scores, key)
+                pub_response["scores"] = index.publisher_scores[key]
+            end
+
+            push!(publishers, pub_response)
+        end
+    end
+
+    # Sort by name
+    sort!(publishers, by=x -> get(x, "name", ""))
+
+    headers = [
+        "Content-Type" => "application/json",
+        "Zotero-API-Version" => "3",
+        "Total-Results" => string(length(publishers)),
+        "Last-Modified-Version" => string(version)
+    ]
+
+    return HTTP.Response(200, headers, JSON3.write(publishers))
+end
+
+"""
+Get a specific publisher.
+GET /users/:userID/publishers/:key
+"""
+function handle_get_publisher(req::HTTP.Request, params::Dict{String, String})
+    key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+    version = index.last_version
+
+    pub = lock(index.lock) do
+        get(index.publishers, key, nothing)
+    end
+
+    if isnothing(pub)
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "Publisher not found")))
+    end
+
+    # Get items from this publisher
+    items_from_pub = lock(index.lock) do
+        [k for (k, pk) in index.item_publishers if pk == key]
+    end
+
+    scores = lock(index.lock) do
+        get(index.publisher_scores, key, nothing)
+    end
+
+    response = Dict{String, Any}(
+        "key" => key,
+        "name" => get(pub, "name", key),
+        "ownership" => get(pub, "ownership", "unknown"),
+        "website" => get(pub, "website", ""),
+        "issn" => get(pub, "issn", []),
+        "itemCount" => length(items_from_pub),
+        "items" => items_from_pub
+    )
+
+    if !isnothing(scores)
+        response["scores"] = scores
+    end
+
+    headers = [
+        "Content-Type" => "application/json",
+        "Zotero-API-Version" => "3",
+        "Last-Modified-Version" => string(version)
+    ]
+
+    return HTTP.Response(200, headers, JSON3.write(response))
+end
+
+"""
+Create or update a publisher.
+PUT /users/:userID/publishers/:key
+
+Request body:
+{
+    "name": "Nature Publishing Group",
+    "ownership": "commercial_large",
+    "website": "https://www.nature.com",
+    "issn": ["1476-4687"]
+}
+"""
+function handle_put_publisher(req::HTTP.Request, params::Dict{String, String})
+    key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+
+    try
+        body = JSON3.read(String(req.body), Dict{String, Any})
+
+        # Validate ownership category
+        ownership = get(body, "ownership", "unknown")
+        if !(ownership in OWNERSHIP_CATEGORIES)
+            return HTTP.Response(400, ["Content-Type" => "application/json"],
+                JSON3.write(Dict(
+                    "error" => "Invalid ownership category",
+                    "validCategories" => OWNERSHIP_CATEGORIES
+                )))
+        end
+
+        pub_data = Dict{String, Any}(
+            "key" => key,
+            "name" => get(body, "name", key),
+            "ownership" => ownership,
+            "website" => get(body, "website", ""),
+            "issn" => get(body, "issn", [])
+        )
+
+        new_version = append_to_journal(Dict(
+            "type" => "publisher",
+            "data" => pub_data,
+            "rationale" => "Publisher registry update via API"
+        ))
+
+        headers = [
+            "Content-Type" => "application/json",
+            "Zotero-API-Version" => "3",
+            "Last-Modified-Version" => string(new_version)
+        ]
+
+        return HTTP.Response(200, headers, JSON3.write(Dict(
+            "key" => key,
+            "version" => new_version,
+            "message" => "Publisher created/updated"
+        )))
+
+    catch e
+        @error "Failed to update publisher" exception=e
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => string(e))))
+    end
+end
+
+"""
+Set quality scores for a publisher.
+PUT /users/:userID/publishers/:key/scores
+
+Request body:
+{
+    "peer_review_rigor": 90,
+    "retraction_rate": 85,
+    "transparency": 80,
+    "reproducibility": 75,
+    "accessibility": 70,
+    "rationale": "Well-established peer review process"
+}
+"""
+function handle_put_publisher_scores(req::HTTP.Request, params::Dict{String, String})
+    key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+
+    # Check if publisher exists
+    pub_exists = lock(index.lock) do
+        haskey(index.publishers, key)
+    end
+
+    if !pub_exists
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "Publisher not found")))
+    end
+
+    try
+        body = JSON3.read(String(req.body), Dict{String, Any})
+
+        # Validate scores
+        scores = Dict{String, Any}()
+        for dim in PUBLISHER_DIMENSIONS
+            if haskey(body, dim)
+                val = body[dim]
+                if !(val isa Number) || val < 0 || val > 100
+                    return HTTP.Response(400, ["Content-Type" => "application/json"],
+                                        JSON3.write(Dict("error" => "Score '$dim' must be 0-100")))
+                end
+                scores[dim] = Float64(val)
+            end
+        end
+
+        if isempty(scores)
+            return HTTP.Response(400, ["Content-Type" => "application/json"],
+                                JSON3.write(Dict("error" => "At least one publisher dimension required")))
+        end
+
+        new_version = append_to_journal(Dict(
+            "type" => "publisher_score",
+            "data" => Dict(
+                "publisherKey" => key,
+                "scores" => scores,
+                "scored_at" => Dates.format(now(UTC), "yyyy-mm-ddTHH:MM:SSZ"),
+                "scored_by" => "api-client"
+            ),
+            "rationale" => get(body, "rationale", "Publisher score update via API")
+        ))
+
+        scores["overall"] = calculate_publisher_score(scores)
+
+        headers = [
+            "Content-Type" => "application/json",
+            "Zotero-API-Version" => "3",
+            "Last-Modified-Version" => string(new_version)
+        ]
+
+        return HTTP.Response(200, headers, JSON3.write(Dict(
+            "publisherKey" => key,
+            "scores" => scores,
+            "version" => new_version
+        )))
+
+    catch e
+        @error "Failed to set publisher scores" exception=e
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => string(e))))
+    end
+end
+
+# Funding tracking handlers (v0.4.0)
+
+"""
+Get funding information for an item.
+GET /users/:userID/items/:key/funding
+"""
+function handle_get_item_funding(req::HTTP.Request, params::Dict{String, String})
+    key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+    version = index.last_version
+
+    item_exists = lock(index.lock) do
+        haskey(index.items, key)
+    end
+
+    if !item_exists
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "Item not found")))
+    end
+
+    funding = lock(index.lock) do
+        get(index.item_funding, key, nothing)
+    end
+
+    if isnothing(funding)
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "No funding information for this item")))
+    end
+
+    headers = [
+        "Content-Type" => "application/json",
+        "Zotero-API-Version" => "3",
+        "Last-Modified-Version" => string(version)
+    ]
+
+    return HTTP.Response(200, headers, JSON3.write(funding))
+end
+
+"""
+Set funding information for an item.
+PUT /users/:userID/items/:key/funding
+
+Request body:
+{
+    "primary_category": "government",
+    "sources": [
+        {"name": "NIH", "grant": "R01-12345", "category": "government"},
+        {"name": "Gates Foundation", "category": "foundation"}
+    ],
+    "disclosure": "full",
+    "conflicts_of_interest": false
+}
+"""
+function handle_put_item_funding(req::HTTP.Request, params::Dict{String, String})
+    key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+
+    item_exists = lock(index.lock) do
+        haskey(index.items, key)
+    end
+
+    if !item_exists
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "Item not found")))
+    end
+
+    try
+        body = JSON3.read(String(req.body), Dict{String, Any})
+
+        # Validate primary category
+        primary = get(body, "primary_category", "unknown")
+        if !(primary in FUNDING_CATEGORIES)
+            return HTTP.Response(400, ["Content-Type" => "application/json"],
+                JSON3.write(Dict(
+                    "error" => "Invalid funding category",
+                    "validCategories" => FUNDING_CATEGORIES
+                )))
+        end
+
+        funding_data = Dict{String, Any}(
+            "itemKey" => key,
+            "primary_category" => primary,
+            "sources" => get(body, "sources", []),
+            "disclosure" => get(body, "disclosure", "unknown"),
+            "conflicts_of_interest" => get(body, "conflicts_of_interest", nothing),
+            "updated_at" => Dates.format(now(UTC), "yyyy-mm-ddTHH:MM:SSZ")
+        )
+
+        new_version = append_to_journal(Dict(
+            "type" => "item_funding",
+            "data" => funding_data,
+            "rationale" => get(body, "rationale", "Funding information update via API")
+        ))
+
+        headers = [
+            "Content-Type" => "application/json",
+            "Zotero-API-Version" => "3",
+            "Last-Modified-Version" => string(new_version)
+        ]
+
+        return HTTP.Response(200, headers, JSON3.write(Dict(
+            "itemKey" => key,
+            "funding" => funding_data,
+            "version" => new_version
+        )))
+
+    catch e
+        @error "Failed to set item funding" exception=e
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => string(e))))
+    end
+end
+
+# Multi-scorer PROMPT handlers (v0.4.0)
+
+"""
+Get aggregated multi-scorer PROMPT scores for an item.
+GET /users/:userID/items/:key/prompt-scores-multi
+"""
+function handle_get_prompt_scores_multi(req::HTTP.Request, params::Dict{String, String})
+    key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+    version = index.last_version
+
+    item_exists = lock(index.lock) do
+        haskey(index.items, key)
+    end
+
+    if !item_exists
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "Item not found")))
+    end
+
+    scores_list = lock(index.lock) do
+        get(index.prompt_scores_multi, key, nothing)
+    end
+
+    if isnothing(scores_list) || isempty(scores_list)
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "No multi-scorer data for this item")))
+    end
+
+    # Extract just the scores dicts for aggregation
+    scores_only = [s["scores"] for s in scores_list]
+    aggregated = aggregate_prompt_scores(scores_only)
+
+    # Add individual scorer metadata
+    aggregated["scorers"] = scores_list
+
+    headers = [
+        "Content-Type" => "application/json",
+        "Zotero-API-Version" => "3",
+        "Last-Modified-Version" => string(version)
+    ]
+
+    response = Dict{String, Any}(
+        "itemKey" => key,
+        "aggregated" => aggregated,
+        "dimensions" => PROMPT_DIMENSIONS
+    )
+
+    return HTTP.Response(200, headers, JSON3.write(response))
+end
+
+"""
+Add a scorer's PROMPT evaluation for an item.
+POST /users/:userID/items/:key/prompt-scores-multi
+
+Request body:
+{
+    "scorer_id": "reviewer1",
+    "provenance": 85,
+    "methodology": 70,
+    ...
+    "rationale": "Detailed review notes"
+}
+"""
+function handle_post_prompt_scores_multi(req::HTTP.Request, params::Dict{String, String})
+    key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+
+    item_exists = lock(index.lock) do
+        haskey(index.items, key)
+    end
+
+    if !item_exists
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "Item not found")))
+    end
+
+    try
+        body = JSON3.read(String(req.body), Dict{String, Any})
+
+        scorer_id = get(body, "scorer_id", "anonymous")
+
+        # Validate scores
+        scores = Dict{String, Any}()
+        for dim in PROMPT_DIMENSIONS
+            if haskey(body, dim)
+                val = body[dim]
+                if !(val isa Number) || val < 0 || val > 100
+                    return HTTP.Response(400, ["Content-Type" => "application/json"],
+                                        JSON3.write(Dict("error" => "Score '$dim' must be 0-100")))
+                end
+                scores[dim] = Float64(val)
+            end
+        end
+
+        if isempty(scores)
+            return HTTP.Response(400, ["Content-Type" => "application/json"],
+                                JSON3.write(Dict("error" => "At least one PROMPT dimension required")))
+        end
+
+        new_version = append_to_journal(Dict(
+            "type" => "prompt_score_multi",
+            "data" => Dict(
+                "itemKey" => key,
+                "scorer_id" => scorer_id,
+                "scores" => scores,
+                "scored_at" => Dates.format(now(UTC), "yyyy-mm-ddTHH:MM:SSZ"),
+                "rationale" => get(body, "rationale", "")
+            ),
+            "rationale" => "Multi-scorer PROMPT evaluation from $scorer_id"
+        ))
+
+        # Get updated aggregation
+        scores_list = lock(index.lock) do
+            get(index.prompt_scores_multi, key, [])
+        end
+
+        scores_only = [s["scores"] for s in scores_list]
+        aggregated = aggregate_prompt_scores(scores_only)
+
+        headers = [
+            "Content-Type" => "application/json",
+            "Zotero-API-Version" => "3",
+            "Last-Modified-Version" => string(new_version)
+        ]
+
+        return HTTP.Response(201, headers, JSON3.write(Dict(
+            "itemKey" => key,
+            "scorer_id" => scorer_id,
+            "version" => new_version,
+            "scorer_count" => length(scores_list),
+            "aggregated" => aggregated
+        )))
+
+    catch e
+        @error "Failed to add multi-scorer evaluation" exception=e
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => string(e))))
+    end
+end
+
+# Blindspot detection handler (v0.4.0)
+
+"""
+Get blindspot analysis for the library.
+GET /users/:userID/blindspots
+"""
+function handle_get_blindspots(req::HTTP.Request, params::Dict{String, String})
+    index = JOURNAL_INDEX[]
+    version = index.last_version
+
+    blindspots = detect_blindspots(index)
+
+    # Summary statistics
+    stats = lock(index.lock) do
+        Dict{String, Any}(
+            "total_items" => length(index.items),
+            "items_with_funding" => length(index.item_funding),
+            "items_with_publisher" => length(index.item_publishers),
+            "items_with_scores" => length(index.prompt_scores),
+            "publishers_registered" => length(index.publishers)
+        )
+    end
+
+    headers = [
+        "Content-Type" => "application/json",
+        "Zotero-API-Version" => "3",
+        "Last-Modified-Version" => string(version)
+    ]
+
+    response = Dict{String, Any}(
+        "blindspots" => blindspots,
+        "blindspot_count" => length(blindspots),
+        "high_severity_count" => count(b -> get(b, "severity", "") == "high", blindspots),
+        "medium_severity_count" => count(b -> get(b, "severity", "") == "medium", blindspots),
+        "low_severity_count" => count(b -> get(b, "severity", "") == "low", blindspots),
+        "library_stats" => stats,
+        "funding_categories" => FUNDING_CATEGORIES,
+        "ownership_categories" => OWNERSHIP_CATEGORIES
+    )
+
+    return HTTP.Response(200, headers, JSON3.write(response))
+end
+
 """
 Check if notes/attachments can be added to an item.
 Canonical DOI items cannot have direct children - must use a variant.
@@ -1175,8 +1995,12 @@ function route_request(req::HTTP.Request)
                 return handle_get_item_children(req, params)
             elseif sub_resource == "prompt-scores"
                 return handle_get_prompt_scores(req, params)
+            elseif sub_resource == "prompt-scores-multi"
+                return handle_get_prompt_scores_multi(req, params)
             elseif sub_resource == "doi-status"
                 return handle_get_doi_status(req, params)
+            elseif sub_resource == "funding"
+                return handle_get_item_funding(req, params)
             else
                 return handle_get_item(req, params)
             end
@@ -1185,10 +2009,14 @@ function route_request(req::HTTP.Request)
                 return handle_post_items(req, params)
             elseif sub_resource == "create-variant"
                 return handle_create_variant(req, params)
+            elseif sub_resource == "prompt-scores-multi"
+                return handle_post_prompt_scores_multi(req, params)
             end
         elseif method == "PUT" && !isnothing(key)
             if sub_resource == "prompt-scores"
                 return handle_put_prompt_scores(req, params)
+            elseif sub_resource == "funding"
+                return handle_put_item_funding(req, params)
             else
                 return handle_put_item(req, params)
             end
@@ -1204,6 +2032,26 @@ function route_request(req::HTTP.Request)
             else
                 return handle_get_collection(req, params)
             end
+        end
+    # v0.4.0: Publisher registry
+    elseif resource == "publishers"
+        if method == "GET"
+            if isnothing(key)
+                return handle_get_publishers(req, params)
+            else
+                return handle_get_publisher(req, params)
+            end
+        elseif method == "PUT" && !isnothing(key)
+            if sub_resource == "scores"
+                return handle_put_publisher_scores(req, params)
+            else
+                return handle_put_publisher(req, params)
+            end
+        end
+    # v0.4.0: Blindspot analysis
+    elseif resource == "blindspots"
+        if method == "GET"
+            return handle_get_blindspots(req, params)
         end
     end
 
@@ -1257,7 +2105,7 @@ function start_server(config::ServerConfig)
     @info "Loading journal..." dir=config.journal_dir
     load_journal!(config)
 
-    @info "Starting Zotero API server (v0.3.0)" host=config.host port=config.port
+    @info "Starting Zotero API server (v0.4.0)" host=config.host port=config.port
     @info "Endpoints available:"
     @info "  GET  /users/$(config.user_id)/items"
     @info "  GET  /users/$(config.user_id)/items/:key"
@@ -1274,7 +2122,20 @@ function start_server(config::ServerConfig)
     @info "DOI immutability (v0.3.0):"
     @info "  GET  /users/$(config.user_id)/items/:key/doi-status"
     @info "  POST /users/$(config.user_id)/items/:key/create-variant"
-    @info "Query filters: ?minScore=80 ?hasScore=true ?hasDOI=true ?isVariant=true"
+    @info "Publisher registry (v0.4.0):"
+    @info "  GET  /users/$(config.user_id)/publishers"
+    @info "  GET  /users/$(config.user_id)/publishers/:key"
+    @info "  PUT  /users/$(config.user_id)/publishers/:key"
+    @info "  PUT  /users/$(config.user_id)/publishers/:key/scores"
+    @info "Funding tracking (v0.4.0):"
+    @info "  GET  /users/$(config.user_id)/items/:key/funding"
+    @info "  PUT  /users/$(config.user_id)/items/:key/funding"
+    @info "Multi-scorer PROMPT (v0.4.0):"
+    @info "  GET  /users/$(config.user_id)/items/:key/prompt-scores-multi"
+    @info "  POST /users/$(config.user_id)/items/:key/prompt-scores-multi"
+    @info "Blindspot analysis (v0.4.0):"
+    @info "  GET  /users/$(config.user_id)/blindspots"
+    @info "Query filters: ?minScore=80 ?hasScore=true ?hasDOI=true ?isVariant=true ?fundingType=industry"
 
     HTTP.serve(handle_request, config.host, config.port)
 end
