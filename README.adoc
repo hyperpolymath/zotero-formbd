@@ -7,7 +7,7 @@ A post-truth reference manager built on dependently-typed FormDB.
 
 == Overview
 
-Zotero-FormDB reimagines bibliographic management for an era where source verification matters. Built on FQL-dt (Form Query Language with Dependent Types), it provides:
+Zotero-FormDB reimagines bibliographic management for an era where source verification matters. Built on FQL-dt (FormDB Query Language with Dependent Types), it provides:
 
 * **Provenance by construction** - You cannot add an item without saying who added it and why
 * **Evidence quality scores** - PROMPT-style ratings (Provenance, Replicability, Objectivity, Methodology, Publication, Transparency)
