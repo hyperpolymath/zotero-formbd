@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """
-Zotero-Compatible REST API Server
+Zotero-Compatible REST API Server (v0.2.0)
 
 Serves FormDB journal data through Zotero's REST API endpoints.
 This allows existing Zotero clients to work with FormDB storage.
@@ -15,6 +15,10 @@ Endpoints implemented:
   PUT  /users/:userID/items/:key      - Update item
   DELETE /users/:userID/items/:key    - Delete item
 
+PROMPT scoring endpoints (v0.2.0):
+  GET  /users/:userID/items/:key/prompt-scores - Get PROMPT scores
+  PUT  /users/:userID/items/:key/prompt-scores - Set PROMPT scores
+
 Query parameters supported:
   format=json (default)
   limit=100 (default, max 100)
@@ -23,6 +27,8 @@ Query parameters supported:
   direction=desc (default)
   itemType=book,journalArticle,...
   q=search query
+  minScore=0-100 (filter by minimum overall PROMPT score)
+  hasScore=true (filter to only items with PROMPT scores)
 """
 module ZoteroServer
 
@@ -43,6 +49,25 @@ Base.@kwdef struct ServerConfig
     api_key::Union{String, Nothing} = nothing
 end
 
+# PROMPT framework dimensions
+const PROMPT_DIMENSIONS = ["provenance", "replicability", "objectivity", "methodology", "publication", "transparency"]
+
+"""
+Calculate overall PROMPT score (average of 6 dimensions).
+Each dimension should be 0-100.
+"""
+function calculate_overall_score(scores::Dict{String, Any})::Float64
+    total = 0.0
+    count = 0
+    for dim in PROMPT_DIMENSIONS
+        if haskey(scores, dim)
+            total += scores[dim]
+            count += 1
+        end
+    end
+    return count > 0 ? total / count : 0.0
+end
+
 # In-memory index for fast lookups
 mutable struct JournalIndex
     items::Dict{String, Dict{String, Any}}
@@ -50,6 +75,7 @@ mutable struct JournalIndex
     attachments::Dict{String, Vector{Dict{String, Any}}}
     notes::Dict{String, Vector{Dict{String, Any}}}
     collection_items::Dict{String, Vector{String}}
+    prompt_scores::Dict{String, Dict{String, Any}}  # item_key -> PROMPT scores
     last_version::Int
     lock::ReentrantLock
 end
@@ -60,6 +86,7 @@ JournalIndex() = JournalIndex(
     Dict{String, Vector{Dict{String, Any}}}(),
     Dict{String, Vector{Dict{String, Any}}}(),
     Dict{String, Vector{String}}(),
+    Dict{String, Dict{String, Any}}(),
     0,
     ReentrantLock()
 )
@@ -141,7 +168,14 @@ function process_entry!(index::JournalIndex, entry::Dict{String, Any})
     else
         # API format: type and data fields
         entry_type = get(entry, "type", "")
-        data = get(entry, "data", Dict{String, Any}())
+        data_raw = get(entry, "data", nothing)
+        data = if isnothing(data_raw)
+            Dict{String, Any}()
+        elseif data_raw isa Dict
+            Dict{String, Any}(data_raw)
+        else
+            Dict{String, Any}()
+        end
     end
 
     lock(index.lock) do
@@ -189,6 +223,15 @@ function process_entry!(index::JournalIndex, entry::Dict{String, Any})
                     index.collection_items[collection_key] = Vector{String}()
                 end
                 push!(index.collection_items[collection_key], item_key)
+            end
+        elseif entry_type == "prompt_score"
+            item_key = get(data, "itemKey", "")
+            if !isempty(item_key)
+                scores = get(data, "scores", Dict{String, Any}())
+                scores["overall"] = calculate_overall_score(scores)
+                scores["scored_at"] = get(data, "scored_at", "")
+                scores["scored_by"] = get(data, "scored_by", "")
+                index.prompt_scores[item_key] = scores
             end
         end
     end
@@ -238,6 +281,12 @@ function to_zotero_format(item::Dict{String, Any}, version::Int)
         data["extra"] = isempty(existing_extra) ? prov_extra : "$existing_extra\n$prov_extra"
     end
 
+    # Add PROMPT scores if available
+    index = JOURNAL_INDEX[]
+    if haskey(index.prompt_scores, key)
+        response["promptScores"] = index.prompt_scores[key]
+    end
+
     return response
 end
 
@@ -278,6 +327,8 @@ function handle_get_items(req::HTTP.Request, params::Dict{String, String})
     start = parse(Int, get(query, "start", "0"))
     item_type_filter = get(query, "itemType", nothing)
     search_query = get(query, "q", nothing)
+    min_score = get(query, "minScore", nothing)
+    has_score_filter = get(query, "hasScore", nothing)
 
     # Filter and collect items (excluding attachments and notes as top-level)
     items = Vector{Dict{String, Any}}()
@@ -303,6 +354,27 @@ function handle_get_items(req::HTTP.Request, params::Dict{String, String})
             if !isnothing(search_query)
                 title = lowercase(get(item, "title", ""))
                 if !contains(title, lowercase(search_query))
+                    continue
+                end
+            end
+
+            # Apply PROMPT score filters
+            if !isnothing(min_score)
+                min_val = parse(Float64, min_score)
+                if haskey(index.prompt_scores, key)
+                    overall = get(index.prompt_scores[key], "overall", 0.0)
+                    if overall < min_val
+                        continue
+                    end
+                else
+                    # No score = doesn't meet minimum
+                    continue
+                end
+            end
+
+            # Filter for items that have scores
+            if !isnothing(has_score_filter) && lowercase(has_score_filter) == "true"
+                if !haskey(index.prompt_scores, key)
                     continue
                 end
             end
@@ -611,6 +683,141 @@ function handle_delete_item(req::HTTP.Request, params::Dict{String, String})
     return HTTP.Response(204, headers, "")
 end
 
+# PROMPT Score handlers
+
+"""
+Get PROMPT scores for an item.
+GET /users/:userID/items/:key/prompt-scores
+"""
+function handle_get_prompt_scores(req::HTTP.Request, params::Dict{String, String})
+    key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+    version = index.last_version
+
+    # Check if item exists
+    item_exists = lock(index.lock) do
+        haskey(index.items, key)
+    end
+
+    if !item_exists
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "Item not found")))
+    end
+
+    # Get scores
+    scores = lock(index.lock) do
+        get(index.prompt_scores, key, nothing)
+    end
+
+    if isnothing(scores)
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "No PROMPT scores for this item")))
+    end
+
+    headers = [
+        "Content-Type" => "application/json",
+        "Zotero-API-Version" => "3",
+        "Last-Modified-Version" => string(version)
+    ]
+
+    response = Dict{String, Any}(
+        "itemKey" => key,
+        "scores" => scores,
+        "dimensions" => PROMPT_DIMENSIONS
+    )
+
+    return HTTP.Response(200, headers, JSON3.write(response))
+end
+
+"""
+Set PROMPT scores for an item.
+PUT /users/:userID/items/:key/prompt-scores
+
+Request body:
+{
+    "provenance": 85,
+    "replicability": 70,
+    "objectivity": 90,
+    "methodology": 75,
+    "publication": 80,
+    "transparency": 65,
+    "rationale": "Why these scores"
+}
+"""
+function handle_put_prompt_scores(req::HTTP.Request, params::Dict{String, String})
+    key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+
+    # Check if item exists
+    item_exists = lock(index.lock) do
+        haskey(index.items, key)
+    end
+
+    if !item_exists
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "Item not found")))
+    end
+
+    try
+        body = JSON3.read(String(req.body), Dict{String, Any})
+
+        # Validate scores are in range 0-100
+        scores = Dict{String, Any}()
+        for dim in PROMPT_DIMENSIONS
+            if haskey(body, dim)
+                val = body[dim]
+                if !(val isa Number) || val < 0 || val > 100
+                    return HTTP.Response(400, ["Content-Type" => "application/json"],
+                                        JSON3.write(Dict("error" => "Score '$dim' must be 0-100")))
+                end
+                scores[dim] = Float64(val)
+            end
+        end
+
+        if isempty(scores)
+            return HTTP.Response(400, ["Content-Type" => "application/json"],
+                                JSON3.write(Dict("error" => "At least one PROMPT dimension required")))
+        end
+
+        # Add metadata
+        scores["rationale"] = get(body, "rationale", "")
+
+        # Append to journal
+        new_version = append_to_journal(Dict(
+            "type" => "prompt_score",
+            "data" => Dict(
+                "itemKey" => key,
+                "scores" => scores,
+                "scored_at" => Dates.format(now(UTC), "yyyy-mm-ddTHH:MM:SSZ"),
+                "scored_by" => "api-client"
+            ),
+            "rationale" => get(body, "rationale", "PROMPT score update via API")
+        ))
+
+        # Calculate overall
+        scores["overall"] = calculate_overall_score(scores)
+
+        headers = [
+            "Content-Type" => "application/json",
+            "Zotero-API-Version" => "3",
+            "Last-Modified-Version" => string(new_version)
+        ]
+
+        response = Dict{String, Any}(
+            "itemKey" => key,
+            "scores" => scores,
+            "version" => new_version
+        )
+
+        return HTTP.Response(200, headers, JSON3.write(response))
+
+    catch e
+        @error "Failed to set PROMPT scores" exception=e
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => string(e))))
+    end
+end
+
 # Router
 
 function route_request(req::HTTP.Request)
@@ -645,13 +852,19 @@ function route_request(req::HTTP.Request)
                 return handle_get_items(req, params)
             elseif sub_resource == "children"
                 return handle_get_item_children(req, params)
+            elseif sub_resource == "prompt-scores"
+                return handle_get_prompt_scores(req, params)
             else
                 return handle_get_item(req, params)
             end
         elseif method == "POST" && isnothing(key)
             return handle_post_items(req, params)
         elseif method == "PUT" && !isnothing(key)
-            return handle_put_item(req, params)
+            if sub_resource == "prompt-scores"
+                return handle_put_prompt_scores(req, params)
+            else
+                return handle_put_item(req, params)
+            end
         elseif method == "DELETE" && !isnothing(key)
             return handle_delete_item(req, params)
         end
@@ -717,7 +930,7 @@ function start_server(config::ServerConfig)
     @info "Loading journal..." dir=config.journal_dir
     load_journal!(config)
 
-    @info "Starting Zotero API server" host=config.host port=config.port
+    @info "Starting Zotero API server (v0.2.0)" host=config.host port=config.port
     @info "Endpoints available:"
     @info "  GET  /users/$(config.user_id)/items"
     @info "  GET  /users/$(config.user_id)/items/:key"
@@ -728,6 +941,10 @@ function start_server(config::ServerConfig)
     @info "  POST /users/$(config.user_id)/items"
     @info "  PUT  /users/$(config.user_id)/items/:key"
     @info "  DELETE /users/$(config.user_id)/items/:key"
+    @info "PROMPT scoring (v0.2.0):"
+    @info "  GET  /users/$(config.user_id)/items/:key/prompt-scores"
+    @info "  PUT  /users/$(config.user_id)/items/:key/prompt-scores"
+    @info "Query filters: ?minScore=80 ?hasScore=true"
 
     HTTP.serve(handle_request, config.host, config.port)
 end

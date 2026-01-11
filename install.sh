@@ -82,6 +82,7 @@ while [[ $# -gt 0 ]]; do
                 rm -f ~/.local/bin/formdb-server
                 rm -f ~/.local/bin/formdb-sync
                 rm -f ~/.local/bin/formdb-migrate
+                rm -f ~/.local/bin/formdb-score
                 echo -e "${GREEN}✓ FormDB uninstalled${NC}"
             else
                 echo "Cancelled."
@@ -236,6 +237,7 @@ show_plan() {
     echo "  🔧 formdb-server   - Start the Zotero-compatible API server"
     echo "  🔧 formdb-sync     - Sync changes from Zotero"
     echo "  🔧 formdb-migrate  - Re-run full migration"
+    echo "  🔧 formdb-score    - PROMPT evidence quality scoring (v0.2.0)"
     echo
 
     echo -e "${BOLD}What will NOT be modified:${NC}"
@@ -345,6 +347,7 @@ install_commands() {
         echo "  Would create: $bin_dir/formdb-server"
         echo "  Would create: $bin_dir/formdb-sync"
         echo "  Would create: $bin_dir/formdb-migrate"
+        echo "  Would create: $bin_dir/formdb-score"
         return 0
     fi
 
@@ -404,6 +407,16 @@ exec julia --project=. bin/migrate.jl \
 SCRIPT
     chmod +x "$bin_dir/formdb-migrate"
 
+    # formdb-score (v0.2.0)
+    cat > "$bin_dir/formdb-score" << 'SCRIPT'
+#!/usr/bin/env bash
+# PROMPT evidence quality scoring
+FORMDB_HOME="${FORMDB_HOME:-$HOME/.formdb}"
+cd "$FORMDB_HOME/repo/migration"
+exec julia --project=. bin/score.jl "$@"
+SCRIPT
+    chmod +x "$bin_dir/formdb-score"
+
     log_success "Commands installed to $bin_dir/"
 
     # Check if bin is in PATH
@@ -433,6 +446,7 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     rm -f "$HOME/.local/bin/formdb-server"
     rm -f "$HOME/.local/bin/formdb-sync"
     rm -f "$HOME/.local/bin/formdb-migrate"
+    rm -f "$HOME/.local/bin/formdb-score"
     echo "FormDB uninstalled."
 fi
 SCRIPT
@@ -456,6 +470,7 @@ show_complete() {
     echo "  formdb-server         # Start API server (port 8080)"
     echo "  formdb-sync           # Sync from running Zotero"
     echo "  formdb-migrate --apply  # Re-run full migration"
+    echo "  formdb-score          # PROMPT evidence scoring (v0.2.0)"
     echo
 
     echo -e "${BOLD}Quick start:${NC}"
