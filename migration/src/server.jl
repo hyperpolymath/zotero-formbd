@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """
-Zotero-Compatible REST API Server (v0.2.0)
+Zotero-Compatible REST API Server (v0.3.0)
 
 Serves FormDB journal data through Zotero's REST API endpoints.
 This allows existing Zotero clients to work with FormDB storage.
@@ -19,6 +19,10 @@ PROMPT scoring endpoints (v0.2.0):
   GET  /users/:userID/items/:key/prompt-scores - Get PROMPT scores
   PUT  /users/:userID/items/:key/prompt-scores - Set PROMPT scores
 
+DOI immutability endpoints (v0.3.0):
+  GET  /users/:userID/items/:key/doi-status    - Check if canonical/variant
+  POST /users/:userID/items/:key/create-variant - Create editable play-variant
+
 Query parameters supported:
   format=json (default)
   limit=100 (default, max 100)
@@ -29,6 +33,8 @@ Query parameters supported:
   q=search query
   minScore=0-100 (filter by minimum overall PROMPT score)
   hasScore=true (filter to only items with PROMPT scores)
+  hasDOI=true (filter to only DOI items - v0.3.0)
+  isVariant=true (filter to only play-variants - v0.3.0)
 """
 module ZoteroServer
 
@@ -76,6 +82,9 @@ mutable struct JournalIndex
     notes::Dict{String, Vector{Dict{String, Any}}}
     collection_items::Dict{String, Vector{String}}
     prompt_scores::Dict{String, Dict{String, Any}}  # item_key -> PROMPT scores
+    # DOI immutability tracking (v0.3.0)
+    canonical_dois::Dict{String, String}     # DOI string -> canonical item key
+    variant_parents::Dict{String, String}    # variant item key -> parent DOI
     last_version::Int
     lock::ReentrantLock
 end
@@ -87,6 +96,8 @@ JournalIndex() = JournalIndex(
     Dict{String, Vector{Dict{String, Any}}}(),
     Dict{String, Vector{String}}(),
     Dict{String, Dict{String, Any}}(),
+    Dict{String, String}(),  # canonical_dois
+    Dict{String, String}(),  # variant_parents
     0,
     ReentrantLock()
 )
@@ -185,6 +196,17 @@ function process_entry!(index::JournalIndex, entry::Dict{String, Any})
             key = get(data, "key", "")
             if !isempty(key)
                 index.items[key] = data
+                # DOI tracking (v0.3.0): register canonical DOI items
+                doi = get(data, "DOI", "")
+                if !isempty(doi) && !haskey(data, "parentDOI")
+                    # This is a canonical DOI item (not a variant)
+                    index.canonical_dois[doi] = key
+                end
+                # Track play-variants
+                parent_doi = get(data, "parentDOI", "")
+                if !isempty(parent_doi)
+                    index.variant_parents[key] = parent_doi
+                end
             end
         elseif entry_type == "attachment"
             key = get(data, "key", "")
@@ -287,6 +309,28 @@ function to_zotero_format(item::Dict{String, Any}, version::Int)
         response["promptScores"] = index.prompt_scores[key]
     end
 
+    # Add DOI status (v0.3.0)
+    doi = get(item, "DOI", "")
+    parent_doi = get(item, "parentDOI", "")
+    if !isempty(doi) && isempty(parent_doi)
+        # Canonical DOI item - immutable
+        response["doiStatus"] = Dict(
+            "type" => "canonical",
+            "doi" => doi,
+            "immutable" => true,
+            "message" => "This item has a DOI and is immutable. Create a play-variant to make edits."
+        )
+    elseif !isempty(parent_doi)
+        # Play-variant of a DOI item
+        response["doiStatus"] = Dict(
+            "type" => "variant",
+            "parentDOI" => parent_doi,
+            "immutable" => false,
+            "message" => "This is a play-variant. The canonical version is at DOI: $parent_doi"
+        )
+        data["parentDOI"] = parent_doi
+    end
+
     return response
 end
 
@@ -329,6 +373,9 @@ function handle_get_items(req::HTTP.Request, params::Dict{String, String})
     search_query = get(query, "q", nothing)
     min_score = get(query, "minScore", nothing)
     has_score_filter = get(query, "hasScore", nothing)
+    # DOI filters (v0.3.0)
+    has_doi_filter = get(query, "hasDOI", nothing)
+    is_variant_filter = get(query, "isVariant", nothing)
 
     # Filter and collect items (excluding attachments and notes as top-level)
     items = Vector{Dict{String, Any}}()
@@ -376,6 +423,24 @@ function handle_get_items(req::HTTP.Request, params::Dict{String, String})
             if !isnothing(has_score_filter) && lowercase(has_score_filter) == "true"
                 if !haskey(index.prompt_scores, key)
                     continue
+                end
+            end
+
+            # DOI filters (v0.3.0)
+            item_doi = get(item, "DOI", "")
+            item_parent_doi = get(item, "parentDOI", "")
+
+            # Filter for canonical DOI items
+            if !isnothing(has_doi_filter) && lowercase(has_doi_filter) == "true"
+                if isempty(item_doi) || !isempty(item_parent_doi)
+                    continue  # Must have DOI and NOT be a variant
+                end
+            end
+
+            # Filter for play-variants only
+            if !isnothing(is_variant_filter) && lowercase(is_variant_filter) == "true"
+                if isempty(item_parent_doi)
+                    continue  # Must be a variant (has parentDOI)
                 end
             end
 
@@ -587,8 +652,24 @@ function handle_post_items(req::HTTP.Request, params::Dict{String, String})
         body = JSON3.read(String(req.body), Vector{Dict{String, Any}})
 
         created_items = Vector{Dict{String, Any}}()
+        failed_items = Dict{String, Any}()
 
-        for item_data in body
+        for (idx, item_data) in enumerate(body)
+            item_type = get(item_data, "itemType", "")
+            parent_item = get(item_data, "parentItem", "")
+
+            # DOI restriction (v0.3.0): notes and attachments cannot attach to canonical DOI items
+            if item_type in ["note", "attachment"] && !isempty(parent_item)
+                error_msg = check_can_attach_children(parent_item)
+                if !isnothing(error_msg)
+                    failed_items[string(idx-1)] = Dict(
+                        "code" => "DOI_IMMUTABLE",
+                        "message" => error_msg
+                    )
+                    continue
+                end
+            end
+
             # Generate key if not provided
             if !haskey(item_data, "key")
                 item_data["key"] = uppercase(randstring(['A':'Z'; '0':'9'], 8))
@@ -619,7 +700,7 @@ function handle_post_items(req::HTTP.Request, params::Dict{String, String})
             "successful" => Dict(string(i-1) => item for (i, item) in enumerate(created_items)),
             "success" => Dict(string(i-1) => item["key"] for (i, item) in enumerate(created_items)),
             "unchanged" => Dict(),
-            "failed" => Dict()
+            "failed" => failed_items  # Include DOI restriction failures (v0.3.0)
         )))
 
     catch e
@@ -631,6 +712,29 @@ end
 
 function handle_put_item(req::HTTP.Request, params::Dict{String, String})
     key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+
+    # Check if this is a canonical DOI item (v0.3.0)
+    existing_item = lock(index.lock) do
+        get(index.items, key, nothing)
+    end
+
+    if !isnothing(existing_item)
+        doi = get(existing_item, "DOI", "")
+        parent_doi = get(existing_item, "parentDOI", "")
+
+        # If item has DOI and is NOT already a variant, block the edit
+        if !isempty(doi) && isempty(parent_doi)
+            return HTTP.Response(409, ["Content-Type" => "application/json"],
+                JSON3.write(Dict(
+                    "error" => "Cannot modify canonical DOI item",
+                    "code" => "DOI_IMMUTABLE",
+                    "doi" => doi,
+                    "message" => "Items with DOIs are immutable canonical references. Use POST /users/:userID/items/:key/create-variant to create an editable play-variant.",
+                    "createVariantUrl" => "/users/$(SERVER_CONFIG[].user_id)/items/$key/create-variant"
+                )))
+        end
+    end
 
     try
         item_data = JSON3.read(String(req.body), Dict{String, Any})
@@ -818,6 +922,223 @@ function handle_put_prompt_scores(req::HTTP.Request, params::Dict{String, String
     end
 end
 
+# DOI Immutability handlers (v0.3.0)
+
+"""
+Get DOI status for an item.
+GET /users/:userID/items/:key/doi-status
+
+Returns whether item is canonical (immutable), a variant, or has no DOI.
+"""
+function handle_get_doi_status(req::HTTP.Request, params::Dict{String, String})
+    key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+    version = index.last_version
+
+    item = lock(index.lock) do
+        get(index.items, key, nothing)
+    end
+
+    if isnothing(item)
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "Item not found")))
+    end
+
+    doi = get(item, "DOI", "")
+    parent_doi = get(item, "parentDOI", "")
+
+    headers = [
+        "Content-Type" => "application/json",
+        "Zotero-API-Version" => "3",
+        "Last-Modified-Version" => string(version)
+    ]
+
+    if !isempty(doi) && isempty(parent_doi)
+        # Canonical DOI item
+        # Find variants of this DOI
+        variants = lock(index.lock) do
+            [k for (k, pd) in index.variant_parents if pd == doi]
+        end
+
+        response = Dict{String, Any}(
+            "itemKey" => key,
+            "status" => "canonical",
+            "doi" => doi,
+            "immutable" => true,
+            "variantCount" => length(variants),
+            "variants" => variants,
+            "message" => "This item is the canonical DOI reference. It cannot be modified directly."
+        )
+        return HTTP.Response(200, headers, JSON3.write(response))
+
+    elseif !isempty(parent_doi)
+        # Play-variant
+        canonical_key = lock(index.lock) do
+            get(index.canonical_dois, parent_doi, "")
+        end
+
+        response = Dict{String, Any}(
+            "itemKey" => key,
+            "status" => "variant",
+            "parentDOI" => parent_doi,
+            "canonicalKey" => canonical_key,
+            "immutable" => false,
+            "message" => "This is a play-variant of DOI: $parent_doi. It can be freely edited."
+        )
+        return HTTP.Response(200, headers, JSON3.write(response))
+
+    else
+        # No DOI
+        response = Dict{String, Any}(
+            "itemKey" => key,
+            "status" => "no-doi",
+            "immutable" => false,
+            "message" => "This item has no DOI. It can be freely edited."
+        )
+        return HTTP.Response(200, headers, JSON3.write(response))
+    end
+end
+
+"""
+Create a play-variant of a canonical DOI item.
+POST /users/:userID/items/:key/create-variant
+
+Creates an editable copy of a DOI item with parentDOI linking back.
+Notes and annotations can only be attached to play-variants.
+"""
+function handle_create_variant(req::HTTP.Request, params::Dict{String, String})
+    key = get(params, "key", "")
+    index = JOURNAL_INDEX[]
+
+    # Get the original item
+    original = lock(index.lock) do
+        get(index.items, key, nothing)
+    end
+
+    if isnothing(original)
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => "Item not found")))
+    end
+
+    doi = get(original, "DOI", "")
+
+    if isempty(doi)
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+            JSON3.write(Dict(
+                "error" => "Item has no DOI",
+                "code" => "NO_DOI",
+                "message" => "Only items with DOIs need play-variants. This item can be edited directly."
+            )))
+    end
+
+    # Check if already a variant
+    if haskey(original, "parentDOI")
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+            JSON3.write(Dict(
+                "error" => "Item is already a play-variant",
+                "code" => "ALREADY_VARIANT",
+                "parentDOI" => original["parentDOI"],
+                "message" => "This item is already a play-variant. Edit it directly."
+            )))
+    end
+
+    try
+        # Parse optional variant name from body
+        variant_name = ""
+        if !isempty(req.body)
+            body = JSON3.read(String(req.body), Dict{String, Any})
+            variant_name = get(body, "variantName", "")
+        end
+
+        # Create the variant as a copy with parentDOI
+        variant_data = Dict{String, Any}()
+        for (k, v) in original
+            variant_data[k] = v
+        end
+
+        # Generate new key for variant
+        variant_key = uppercase(randstring(['A':'Z'; '0':'9'], 8))
+        variant_data["key"] = variant_key
+
+        # Link to parent DOI (not parent item key - DOI is the identity)
+        variant_data["parentDOI"] = doi
+
+        # Remove the DOI from variant (it's not THE canonical document)
+        delete!(variant_data, "DOI")
+
+        # Mark as variant in title if name provided
+        if !isempty(variant_name)
+            original_title = get(variant_data, "title", "Untitled")
+            variant_data["title"] = "$original_title [$variant_name]"
+        end
+
+        # Set timestamps
+        now_str = Dates.format(now(UTC), "yyyy-mm-ddTHH:MM:SSZ")
+        variant_data["dateAdded"] = now_str
+        variant_data["dateModified"] = now_str
+
+        # Add extra field noting this is a variant
+        existing_extra = get(variant_data, "extra", "")
+        variant_extra = "FormDB-Variant-Of: $doi\nFormDB-Variant-Created: $now_str"
+        variant_data["extra"] = isempty(existing_extra) ? variant_extra : "$existing_extra\n$variant_extra"
+
+        # Append to journal
+        new_version = append_to_journal(Dict(
+            "type" => "item",
+            "data" => variant_data,
+            "rationale" => "Created play-variant of canonical DOI item: $doi"
+        ))
+
+        headers = [
+            "Content-Type" => "application/json",
+            "Zotero-API-Version" => "3",
+            "Last-Modified-Version" => string(new_version)
+        ]
+
+        response = Dict{String, Any}(
+            "variantKey" => variant_key,
+            "parentDOI" => doi,
+            "canonicalKey" => key,
+            "version" => new_version,
+            "message" => "Play-variant created. You can now edit this variant and attach notes/annotations to it.",
+            "item" => to_zotero_format(variant_data, new_version)
+        )
+
+        return HTTP.Response(201, headers, JSON3.write(response))
+
+    catch e
+        @error "Failed to create variant" exception=e
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                            JSON3.write(Dict("error" => string(e))))
+    end
+end
+
+"""
+Check if notes/attachments can be added to an item.
+Canonical DOI items cannot have direct children - must use a variant.
+"""
+function check_can_attach_children(parent_key::String)::Union{Nothing, String}
+    index = JOURNAL_INDEX[]
+
+    parent_item = lock(index.lock) do
+        get(index.items, parent_key, nothing)
+    end
+
+    if isnothing(parent_item)
+        return "Parent item not found"
+    end
+
+    doi = get(parent_item, "DOI", "")
+    parent_doi = get(parent_item, "parentDOI", "")
+
+    # If parent has DOI and is not itself a variant, block attachment
+    if !isempty(doi) && isempty(parent_doi)
+        return "Cannot attach notes/files to canonical DOI items. Create a play-variant first using POST /users/:userID/items/$parent_key/create-variant"
+    end
+
+    return nothing  # OK to attach
+end
+
 # Router
 
 function route_request(req::HTTP.Request)
@@ -854,11 +1175,17 @@ function route_request(req::HTTP.Request)
                 return handle_get_item_children(req, params)
             elseif sub_resource == "prompt-scores"
                 return handle_get_prompt_scores(req, params)
+            elseif sub_resource == "doi-status"
+                return handle_get_doi_status(req, params)
             else
                 return handle_get_item(req, params)
             end
-        elseif method == "POST" && isnothing(key)
-            return handle_post_items(req, params)
+        elseif method == "POST"
+            if isnothing(key)
+                return handle_post_items(req, params)
+            elseif sub_resource == "create-variant"
+                return handle_create_variant(req, params)
+            end
         elseif method == "PUT" && !isnothing(key)
             if sub_resource == "prompt-scores"
                 return handle_put_prompt_scores(req, params)
@@ -930,7 +1257,7 @@ function start_server(config::ServerConfig)
     @info "Loading journal..." dir=config.journal_dir
     load_journal!(config)
 
-    @info "Starting Zotero API server (v0.2.0)" host=config.host port=config.port
+    @info "Starting Zotero API server (v0.3.0)" host=config.host port=config.port
     @info "Endpoints available:"
     @info "  GET  /users/$(config.user_id)/items"
     @info "  GET  /users/$(config.user_id)/items/:key"
@@ -944,7 +1271,10 @@ function start_server(config::ServerConfig)
     @info "PROMPT scoring (v0.2.0):"
     @info "  GET  /users/$(config.user_id)/items/:key/prompt-scores"
     @info "  PUT  /users/$(config.user_id)/items/:key/prompt-scores"
-    @info "Query filters: ?minScore=80 ?hasScore=true"
+    @info "DOI immutability (v0.3.0):"
+    @info "  GET  /users/$(config.user_id)/items/:key/doi-status"
+    @info "  POST /users/$(config.user_id)/items/:key/create-variant"
+    @info "Query filters: ?minScore=80 ?hasScore=true ?hasDOI=true ?isVariant=true"
 
     HTTP.serve(handle_request, config.host, config.port)
 end

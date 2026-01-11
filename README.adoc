@@ -236,6 +236,20 @@ formdb-score --item KEY [--provenance N] [--methodology N] ...
     Set PROMPT evidence quality scores for an item (v0.2.0).
     Each dimension is 0-100. Use --all N for quick scoring.
     Use --list-unscored to find items needing evaluation.
+
+formdb-doi --status KEY
+    Check DOI status of an item (v0.3.0).
+    Shows if item is canonical (immutable) or a play-variant.
+
+formdb-doi --create-variant KEY [--name NAME]
+    Create an editable play-variant of a canonical DOI item.
+    Notes and annotations can only be attached to variants.
+
+formdb-doi --list-doi
+    List all canonical DOI items in your library.
+
+formdb-doi --list-variants
+    List all play-variants you've created.
 ----
 
 == API Examples
@@ -277,6 +291,21 @@ curl "http://localhost:8080/users/local/items?minScore=80"
 
 # Get only items that have been scored
 curl "http://localhost:8080/users/local/items?hasScore=true"
+
+# DOI Immutability (v0.3.0)
+# Check if an item is a canonical DOI item
+curl "http://localhost:8080/users/local/items/ABC12345/doi-status"
+
+# Create a play-variant for annotation
+curl -X POST "http://localhost:8080/users/local/items/ABC12345/create-variant" \
+    -H "Content-Type: application/json" \
+    -d '{"variantName": "My Notes"}'
+
+# List only canonical DOI items
+curl "http://localhost:8080/users/local/items?hasDOI=true"
+
+# List only play-variants
+curl "http://localhost:8080/users/local/items?isVariant=true"
 ----
 
 == Uninstall
@@ -491,14 +520,17 @@ julia --project=. bin/migrate.jl --from /path/to/your/zotero.sqlite --to ~/.form
 * formdb-score CLI for evidence evaluation
 * Scores stored in journal with provenance
 
-=== v0.3.0: DOI Immutability (Next)
+=== v0.3.0: DOI Immutability ✓
 * DOI items become canonical, immutable references
 * Edits to DOI items create "play-variants" (clearly marked forks)
 * Notes/annotations can ONLY attach to play-variants
 * DOI canonical versions remain pristine - you KNOW it's that document
-* `parent_doi` field links variants back to canonical source
+* `parentDOI` field links variants back to canonical source
+* `formdb-doi` CLI for DOI management
+* API endpoints: `/doi-status`, `/create-variant`
+* Query filters: `?hasDOI=true`, `?isVariant=true`
 
-=== v0.4.0: Full Integration
+=== v0.4.0: Full Integration (Next)
 * Browser connector plugin
 * Desktop app integration
 * Real-time sync

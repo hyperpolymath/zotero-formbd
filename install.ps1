@@ -162,6 +162,7 @@ function Show-Plan {
     Write-Host "  formdb-sync     - Sync changes from Zotero"
     Write-Host "  formdb-migrate  - Re-run full migration"
     Write-Host "  formdb-score    - PROMPT evidence quality scoring (v0.2.0)"
+    Write-Host "  formdb-doi      - DOI immutability management (v0.3.0)"
     Write-Host ""
 
     Write-Host "What will NOT be modified:" -ForegroundColor White
@@ -258,6 +259,7 @@ function Install-Commands {
         Write-Host "  Would create: $BinDir\formdb-sync.bat"
         Write-Host "  Would create: $BinDir\formdb-migrate.bat"
         Write-Host "  Would create: $BinDir\formdb-score.bat"
+        Write-Host "  Would create: $BinDir\formdb-doi.bat"
         return
     }
 
@@ -309,6 +311,15 @@ cd /d "%FORMDB_HOME%\repo\migration"
 julia --project=. bin/score.jl %*
 "@ | Set-Content "$BinDir\formdb-score.bat" -Encoding ASCII
 
+    # formdb-doi.bat (v0.3.0)
+    @"
+@echo off
+REM DOI immutability management
+set FORMDB_HOME=%USERPROFILE%\.formdb
+cd /d "%FORMDB_HOME%\repo\migration"
+julia --project=. bin/doi.jl %*
+"@ | Set-Content "$BinDir\formdb-doi.bat" -Encoding ASCII
+
     Write-Success "Commands installed to $BinDir\"
 
     # Add to PATH if not already there
@@ -358,6 +369,7 @@ function Show-Complete {
     Write-Host "  formdb-sync           # Sync from running Zotero"
     Write-Host "  formdb-migrate -Apply # Re-run full migration"
     Write-Host "  formdb-score          # PROMPT evidence scoring (v0.2.0)"
+    Write-Host "  formdb-doi            # DOI management (v0.3.0)"
     Write-Host ""
 
     Write-Host "Quick start:" -ForegroundColor White
