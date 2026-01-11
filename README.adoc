@@ -545,3 +545,4 @@ AGPL-3.0-or-later
 * link:https://github.com/hyperpolymath/zotero-librarian[Zotero-Librarian] - Filename normalization tool
 * link:https://www.zotero.org[Zotero] - The original reference manager we build on top of
 * link:https://github.com/hyperpolymath/formdb-debugger[FormDB Debugger] - Proof-carrying database debugger
+* link:https://github.com/hyperpolymath/formbase[FormBase] - Open-source Airtable alternative with provenance
