@@ -2,8 +2,204 @@
 = Zotero-FormDB
 :toc:
 :toc-placement: preamble
+:toclevels: 3
 
 A post-truth reference manager built on dependently-typed FormDB.
+
+== Quick Start
+
+=== Path A: I Already Use Zotero
+
+You have Zotero with a library. You want FormDB's provenance tracking and cloud-safe storage.
+
+*Time: ~5 minutes*
+
+[source,bash]
+----
+# 1. Install Julia (if you don't have it)
+curl -fsSL https://install.julialang.org | sh
+# Then restart your terminal, or run: source ~/.bashrc
+
+# 2. Run the installer (shows what it will do first)
+curl -sSL https://raw.githubusercontent.com/hyperpolymath/zotero-formdb/main/install.sh | bash
+
+# 3. If the plan looks good, actually install
+curl -sSL https://raw.githubusercontent.com/hyperpolymath/zotero-formdb/main/install.sh | bash -s -- --apply
+
+# 4. Start the server
+formdb-server
+
+# 5. Test it
+curl http://localhost:8080/users/local/items?limit=3
+----
+
+*What just happened:*
+
+* Your Zotero library was copied (not moved!) to `~/.formdb/zotero/`
+* Each item now has provenance tracking ("migrated from Zotero")
+* You have a Zotero-compatible API server on localhost:8080
+* Your original Zotero is untouched and still works normally
+
+*Keep them in sync:*
+
+[source,bash]
+----
+# With Zotero running, sync any changes to FormDB
+formdb-sync
+----
+
+=== Path B: I'm New to Reference Management
+
+You've been told this is better than Zotero. You don't have Zotero. Let's get you set up from scratch.
+
+*Time: ~10 minutes*
+
+==== Step 1: Install Zotero (the UI)
+
+FormDB uses Zotero's excellent UI. Install Zotero first:
+
+[source,bash]
+----
+# Fedora/RHEL
+sudo dnf install zotero
+
+# Ubuntu/Debian
+sudo apt install zotero
+
+# Or download from: https://www.zotero.org/download/
+----
+
+==== Step 2: Install Julia (the engine)
+
+[source,bash]
+----
+curl -fsSL https://install.julialang.org | sh
+# Restart your terminal after this
+----
+
+==== Step 3: Open Zotero Once
+
+Open Zotero from your applications menu. This creates your library. You can close it after.
+
+==== Step 4: Install FormDB
+
+[source,bash]
+----
+# Preview the installation
+curl -sSL https://raw.githubusercontent.com/hyperpolymath/zotero-formdb/main/install.sh | bash
+
+# If it looks good, install
+curl -sSL https://raw.githubusercontent.com/hyperpolymath/zotero-formdb/main/install.sh | bash -s -- --apply
+----
+
+==== Step 5: Daily Workflow
+
+[source,bash]
+----
+# 1. Use Zotero normally to add papers, books, etc.
+#    (Browser connector works, drag-and-drop works, everything works)
+
+# 2. When you want your changes in FormDB, run:
+formdb-sync
+
+# 3. To query your library programmatically:
+formdb-server &
+curl http://localhost:8080/users/local/items
+----
+
+=== What Do I Get?
+
+|===
+| Feature | Regular Zotero | Zotero + FormDB
+
+| Add papers from browser
+| ✓
+| ✓ (use Zotero, then sync)
+
+| Organize into collections
+| ✓
+| ✓
+
+| Cloud sync (Dropbox, etc.)
+| ⚠️ Corruption risk
+| ✓ Safe (append-only)
+
+| "Who added this?"
+| ❌ Not tracked
+| ✓ Required
+
+| "Why was this added?"
+| ❌ Optional note
+| ✓ Required rationale
+
+| Undo any change
+| ❌ Hope you have backups
+| ✓ Full history
+
+| Query via API
+| ❌ Need plugins
+| ✓ REST API included
+
+| Evidence quality scores
+| ❌
+| ✓ PROMPT framework
+|===
+
+== Commands Reference
+
+After installation, you have three commands:
+
+[source,bash]
+----
+formdb-server [--port 8080] [--host 127.0.0.1]
+    Start the Zotero-compatible REST API server.
+    Your library is available at http://localhost:8080/users/local/items
+
+formdb-sync [--dry-run] [--verbose]
+    Sync changes from running Zotero to FormDB.
+    Requires Zotero to be open (uses local API on port 23119).
+
+formdb-migrate --apply
+    Re-run full migration from Zotero SQLite.
+    Use this if sync gets out of date or you want a fresh start.
+----
+
+== API Examples
+
+[source,bash]
+----
+# List all items
+curl http://localhost:8080/users/local/items
+
+# Get a specific item
+curl http://localhost:8080/users/local/items/ABC12345
+
+# List collections
+curl http://localhost:8080/users/local/collections
+
+# Get items in a collection
+curl http://localhost:8080/users/local/collections/XYZ98765/items
+
+# Search for items
+curl "http://localhost:8080/users/local/items?q=climate+change"
+
+# Filter by item type
+curl "http://localhost:8080/users/local/items?itemType=journalArticle"
+
+# Paginate
+curl "http://localhost:8080/users/local/items?limit=50&start=100"
+----
+
+== Uninstall
+
+[source,bash]
+----
+# Remove FormDB completely (Zotero is NOT affected)
+~/.formdb/uninstall.sh
+
+# Or
+curl -sSL https://raw.githubusercontent.com/hyperpolymath/zotero-formdb/main/install.sh | bash -s -- --uninstall
+----
 
 == Overview
 
@@ -15,7 +211,7 @@ Zotero-FormDB reimagines bibliographic management for an era where source verifi
 * **Cloud-safe storage** - Append-only journal works on Dropbox, GDrive, OneDrive without corruption
 * **Machine-checkable integrity** - Types ARE proofs; the compiler verifies your data
 
-== Why Not SQLite?
+== Why Not Just SQLite?
 
 |===
 | Problem | SQLite | Zotero-FormDB
@@ -46,24 +242,26 @@ Zotero-FormDB reimagines bibliographic management for an era where source verifi
 [source,text]
 ----
 ┌─────────────────────────────────────────────────────────────┐
-│  Zotero Connector (Browser Extension / Desktop App)         │
-│  Existing Zotero UX preserved                               │
+│  Zotero (Browser Extension / Desktop App)                   │
+│  You keep using Zotero normally                             │
 ├─────────────────────────────────────────────────────────────┤
-│  API Compatibility Layer (Julia/Rust)                       │
-│  Speaks Zotero Web API, translates to FQL-dt                │
+│  Sync Bridge (formdb-sync)                                  │
+│  Pulls changes from Zotero's local API                      │
 ├─────────────────────────────────────────────────────────────┤
-│  FQL-dt Runtime (Lean 4)                                    │
-│  Type-checked queries, proof obligations                    │
+│  FormDB Journal (append-only)                               │
+│  ~/.formdb/zotero/journal.jsonl                             │
+│  Content-addressed, hash-chained, provenance-tracked        │
 ├─────────────────────────────────────────────────────────────┤
-│  Form.Journal (Append-Only)                                 │
-│  Content-addressed, Merkle-verified                         │
+│  REST API Server (formdb-server)                            │
+│  Zotero-compatible endpoints on localhost:8080              │
 ├─────────────────────────────────────────────────────────────┤
-│  Cloud Storage (Dropbox / GDrive / OneDrive / Local)        │
-│  Just files - no special sync needed                        │
+│  Cloud Storage (optional)                                   │
+│  Just copy ~/.formdb/ to Dropbox/GDrive/OneDrive            │
+│  Append-only = no corruption from concurrent writes         │
 └─────────────────────────────────────────────────────────────┘
 ----
 
-== Core Types
+== Core Types (Lean 4)
 
 [source,lean]
 ----
@@ -87,85 +285,65 @@ structure PromptScores where
   overall_correct : overall.val = (provenance.val + replicability.val +
                     objective.val + methodology.val + publication.val +
                     transparency.val) / 6
-
--- Attachments with content hash
-structure Attachment where
-  id : ValidUUID
-  parent : ValidUUID
-  filename : NonEmptyString
-  contentHash : Blake3Hash
-  mimeType : MimeType
-  prompt_scores : Option PromptScores
 ----
 
-== Installation
+== Troubleshooting
+
+=== "Cannot connect to Zotero" when running formdb-sync
+
+Zotero must be running for sync to work. The sync bridge connects to Zotero's local API on port 23119.
 
 [source,bash]
 ----
-# Install Lean 4 (via elan)
-curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh
-
-# Clone and build
-git clone https://github.com/hyperpolymath/zotero-formdb
-cd zotero-formdb
-lake build
+# Check if Zotero's API is available
+curl http://localhost:23119/api/users/0/items?limit=1
 ----
 
-== Migration from Zotero
+=== "Julia not found"
+
+Make sure Julia is installed and in your PATH:
 
 [source,bash]
 ----
-# Export existing Zotero library
-zotero-formdb migrate --from ~/.zotero/zotero.sqlite --to ~/FormDB/zotero
+# Install Julia
+curl -fsSL https://install.julialang.org | sh
 
-# Items without provenance get default: "Migrated from Zotero SQLite"
+# Restart your terminal, then verify
+julia --version
 ----
 
-== Usage
+=== "Zotero database not found"
 
-[source,lean]
+The installer looks for Zotero's database in common locations. If yours is elsewhere:
+
+[source,bash]
 ----
--- Insert with provenance (required by type!)
-INSERT INTO items (title, itemType)
-VALUES ('ONS CPI Data 2023', 'report')
-ADDED_BY "researcher_alice"
-RATIONALE "Primary source for UK inflation analysis"
-WITH_PROMPT_SCORES {
-  provenance: 100,      -- Official government data
-  replicability: 100,   -- Publicly available
-  objective: 95,        -- Statistical methodology
-  methodology: 95,      -- Well-documented
-  publication: 100,     -- Peer review equivalent
-  transparency: 95      -- Full methodology published
-};
+# Find it manually
+find ~ -name "zotero.sqlite" 2>/dev/null
 
--- Query with quality filter (type proves all results meet threshold)
-SELECT (item : ZoteroItem | item.prompt_scores.overall > 80)
-FROM items
-WHERE itemType = 'report';
+# Then run migration manually
+cd ~/.formdb/repo/migration
+julia --project=. bin/migrate.jl --from /path/to/your/zotero.sqlite --to ~/.formdb/zotero --apply
 ----
 
 == Roadmap
 
-=== v0.1.0: Core Types + Journal
+=== v0.1.0: Core Types + Journal ✓
 * Lean 4 type definitions
 * Append-only journal format
-* Basic CRUD with provenance
-
-=== v0.2.0: Migration + CLI
 * SQLite migration tool
-* Command-line interface
-* Cloud storage adapter
+* REST API server
+* Sync bridge
 
-=== v0.3.0: Zotero API Compatibility
-* Web API endpoints
-* Browser connector support
-* Desktop app integration
-
-=== v0.4.0: PROMPT Scoring
-* Evidence quality ratings
+=== v0.2.0: Evidence Quality (Next)
+* PROMPT scoring UI
 * Confidence-indexed claims
-* Reversibility proofs
+* Quality-filtered queries
+
+=== v0.3.0: Full Integration
+* Browser connector plugin
+* Desktop app integration
+* Real-time sync
 
 == License
 
@@ -174,8 +352,5 @@ AGPL-3.0-or-later
 == Related Projects
 
 * link:https://github.com/hyperpolymath/formdb[FormDB] - The underlying narrative-first database engine
-* link:https://github.com/hyperpolymath/fqldt[FQLdt] - Dependently-typed Form Query Language (compile-time proofs)
-* link:https://github.com/hyperpolymath/formdb-studio[FormDB Studio] - Zero-friction GUI for non-technical users
-* link:https://github.com/hyperpolymath/bofig[BoFIG] - Evidence graph for investigative journalism
 * link:https://github.com/hyperpolymath/zotero-librarian[Zotero-Librarian] - Filename normalization tool
-* link:https://www.zotero.org[Zotero] - The original reference manager
+* link:https://www.zotero.org[Zotero] - The original reference manager we build on top of
