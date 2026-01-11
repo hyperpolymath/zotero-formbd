@@ -9,7 +9,15 @@ Also works on cloud-drives.
 
 == Quick Start
 
-=== Path A: I Already Use Zotero
+Choose your platform:
+
+* <<linux-macos>> - Linux and macOS
+* <<windows>> - Windows 10/11
+
+[[linux-macos]]
+=== Linux / macOS
+
+==== Path A: I Already Use Zotero
 
 You have Zotero with a library. You want FormDB's provenance tracking and cloud-safe storage.
 
@@ -106,6 +114,66 @@ formdb-sync
 # 3. To query your library programmatically:
 formdb-server &
 curl http://localhost:8080/users/local/items
+----
+
+[[windows]]
+=== Windows
+
+==== Prerequisites
+
+1. **Install Julia**: Download from https://julialang.org/downloads/ and run the installer
+2. **Install Git**: Download from https://git-scm.com/download/win
+3. **Install Zotero**: Download from https://www.zotero.org/download/
+4. Open Zotero once to create your library, then close it
+
+==== Installation
+
+Open PowerShell and run:
+
+[source,powershell]
+----
+# 1. Download the installer
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/hyperpolymath/zotero-formdb/main/install.ps1" -OutFile "install.ps1"
+
+# 2. Preview what will happen
+.\install.ps1
+
+# 3. If the plan looks good, actually install
+.\install.ps1 -Apply
+
+# 4. Restart your terminal (for PATH changes)
+
+# 5. Start the server
+formdb-server
+
+# 6. Test it
+Invoke-RestMethod http://localhost:8080/users/local/items?limit=3
+----
+
+==== Daily Workflow
+
+[source,powershell]
+----
+# 1. Use Zotero normally to add papers, books, etc.
+
+# 2. When you want your changes in FormDB, run:
+formdb-sync
+
+# 3. To query your library:
+formdb-server
+# Then in another terminal:
+Invoke-RestMethod http://localhost:8080/users/local/items
+----
+
+==== Uninstall
+
+[source,powershell]
+----
+# Option 1: Use the uninstall script
+~\.formdb\uninstall.ps1
+
+# Option 2: Re-run installer with -Uninstall
+.\install.ps1 -Uninstall
 ----
 
 === What Do I Get?
