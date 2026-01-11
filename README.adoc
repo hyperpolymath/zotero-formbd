@@ -4,7 +4,8 @@
 :toc-placement: preamble
 :toclevels: 3
 
-A post-truth reference manager built on dependently-typed FormDB.
+A narrative and provenance based FormDB application for the reference manager Zotero. 
+Also works on cloud-drives.
 
 == Quick Start
 
