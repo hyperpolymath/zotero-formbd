@@ -62,7 +62,7 @@ formdb-sync
 
 === Path B: I'm New to Reference Management
 
-You've been told this is better than Zotero. You don't have Zotero. Let's get you set up from scratch.
+You've been told this is a better way 'to do' Zotero. You don't have Zotero. Let's get you set up from scratch.
 
 *Time: ~10 minutes*
 
